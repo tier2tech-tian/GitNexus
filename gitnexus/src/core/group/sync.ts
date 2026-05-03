@@ -8,7 +8,7 @@ import { HttpRouteExtractor } from './extractors/http-route-extractor.js';
 import { GrpcExtractor } from './extractors/grpc-extractor.js';
 import { TopicExtractor } from './extractors/topic-extractor.js';
 import { ManifestExtractor } from './extractors/manifest-extractor.js';
-import { runExactMatch } from './matching.js';
+import { runExactMatch, runWildcardMatch, buildProviderIndex } from './matching.js';
 import { detectServiceBoundaries, assignService } from './service-boundary-detector.js';
 import type { CypherExecutor } from './contract-extractor.js';
 import { writeContractRegistry } from './storage.js';
@@ -208,13 +208,18 @@ export async function syncGroup(config: GroupConfig, opts?: SyncOptions): Promis
     }
   }
 
-  const { matched, unmatched } = runExactMatch(autoContracts, undefined, config.matching);
+  const providerIndex = buildProviderIndex(autoContracts, config.matching);
+  const { matched, unmatched } = runExactMatch(autoContracts, providerIndex, config.matching);
+
+  // Run wildcard match on remaining unmatched contracts (gRPC wildcard consumers
+  // like `grpc::ServiceName/*` that exact match skips by design).
+  const { matched: wildcardMatched } = runWildcardMatch(unmatched, providerIndex);
 
   // Dedupe cross-links. Manifest contracts participate in runExactMatch, so a
   // manifest-declared link can also emit a matchType:'exact' CrossLink with the
   // same endpoints. Prefer the manifest version — it reflects operator intent
   // and carries matchType:'manifest' which downstream consumers may rely on.
-  const crossLinks = dedupeCrossLinks([...manifestCrossLinks, ...matched]);
+  const crossLinks = dedupeCrossLinks([...manifestCrossLinks, ...matched, ...wildcardMatched]);
   const allContracts: StoredContract[] = autoContracts;
 
   const registry: ContractRegistry = {

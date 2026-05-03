@@ -77,9 +77,14 @@ export const GO_GRPC_PLUGIN: GrpcLanguagePlugin = {
 
       const newClientMatch = NEW_CLIENT_RE.exec(fnText);
       if (newClientMatch) {
+        // Go HTTP-gateway wrappers generated from gRPC protos commonly name
+        // the constructor `New<Service>HttpClient` (e.g. NewFooHttpClient)
+        // while the proto service is just `Foo`. Strip the `Http` suffix so
+        // the consumer contractId matches the proto-derived provider id.
+        const serviceName = newClientMatch[1].replace(/Http$/, '');
         out.push({
           role: 'consumer',
-          serviceName: newClientMatch[1],
+          serviceName,
           symbolName: fnText,
           source: 'go_client',
           confidenceWithProto: 0.75,
