@@ -17,7 +17,7 @@
 
 import fs from 'fs/promises';
 import lbug from '@ladybugdb/core';
-import { loadFTSExtension } from './lbug-adapter.js';
+import { loadFTSExtension, loadVectorExtension } from './lbug-adapter.js';
 import { createLbugDatabase } from './lbug-config.js';
 
 /** Per-repo pool: one Database, many Connections */
@@ -355,6 +355,11 @@ async function doInitLbug(repoId: string, dbPath: string): Promise<void> {
     shared.ftsLoaded = await loadFTSExtension(available[0], { policy: 'load-only' });
   }
 
+  // Load VECTOR extension for semantic search (same policy as FTS).
+  try {
+    await loadVectorExtension(available[0], { policy: 'load-only' });
+  } catch { /* vector search degrades gracefully */ }
+
   // Register pool entry only after all connections are pre-warmed and FTS is
   // loaded.  Concurrent executeQuery calls see either "not initialized"
   // (and throw cleanly) or a fully ready pool — never a half-built one.
@@ -419,6 +424,10 @@ export async function initLbugWithDb(
   if (!shared.ftsLoaded) {
     shared.ftsLoaded = await loadFTSExtension(available[0], { policy: 'load-only' });
   }
+
+  try {
+    await loadVectorExtension(available[0], { policy: 'load-only' });
+  } catch { /* vector search degrades gracefully */ }
 
   pool.set(repoId, {
     db: existingDb,
