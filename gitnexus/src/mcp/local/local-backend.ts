@@ -3541,6 +3541,7 @@ export class LocalBackend {
     await this.ensureInitialized(repo.id);
 
     const direction = params.direction || 'downstream';
+    const stopAt = params.stopAt || 'dao';
     const maxDepth = Math.min(params.maxDepth || 10, 32);
     const maxPaths = params.maxPaths || 20;
     const MAX_QUEUE_SIZE = 5000;
@@ -3635,16 +3636,18 @@ export class LocalBackend {
           if (state.visited.has(neighbor.id)) continue; // cycle in this path
 
           const newPath = [...state.path, { id: neighbor.id, name: neighbor.name, filePath: neighbor.filePath }];
-          const isDao = LocalBackend.isDao(neighbor.filePath);
+          // stopAt 终止条件（默认 dao = DAO 路径匹配）
+          const isTerminal = stopAt === 'dao' ? LocalBackend.isDao(neighbor.filePath) : false;
 
-          if (isDao) {
-            // Found a DAO endpoint — record path
+          maxDepthUsed = Math.max(maxDepthUsed, newPath.length);
+
+          if (isTerminal) {
+            // Found a terminal endpoint — record path
             foundPaths.push({
               steps: newPath.map((n) => n.name),
-              endNode: { name: neighbor.name, filePath: neighbor.filePath, isDao: true },
+              endNode: { name: neighbor.name, filePath: neighbor.filePath, isDao: stopAt === 'dao' },
               depth: newPath.length,
             });
-            maxDepthUsed = Math.max(maxDepthUsed, newPath.length);
             if (foundPaths.length >= maxPaths) break;
           } else {
             // Continue exploring

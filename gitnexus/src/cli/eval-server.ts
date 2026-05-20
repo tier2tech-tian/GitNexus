@@ -340,7 +340,6 @@ function formatCallPathsResult(result: any): string {
     lines.push('paths:');
     for (const p of paths) {
       const steps = p.steps || [];
-      const last = steps[steps.length - 1];
       lines.push(`  ${steps.join(' → ')}${p.endNode?.isDao ? ' [DAO]' : ''}`);
     }
   }
