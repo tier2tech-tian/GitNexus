@@ -274,6 +274,81 @@ export function formatListReposResult(result: any): string {
   return lines.join('\n');
 }
 
+// ─── Traverse Formatter ───────────────────────────────────────────────
+
+function formatTraverseNode(node: any, indent: number): string[] {
+  const prefix = '  '.repeat(indent);
+  const daoTag = node.isDao ? '[DAO] ' : '';
+  const lines: string[] = [`${prefix}${daoTag}${node.name} → ${node.filePath || '?'}`];
+  if (node.children) {
+    for (const child of node.children) {
+      lines.push(...formatTraverseNode(child, indent + 1));
+    }
+  }
+  return lines;
+}
+
+function formatTraverseResult(result: any): string {
+  if (result.error) return `Error: ${result.error}`;
+  if (result.status === 'ambiguous') {
+    const lines = [`Multiple symbols found. Disambiguate with target_uid:\n`];
+    for (const c of result.candidates || []) {
+      lines.push(`  ${c.name} (${c.kind}) → ${c.filePath}  uid: ${c.uid}`);
+    }
+    return lines.join('\n');
+  }
+
+  const root = result.root;
+  if (!root) return 'No traverse result.';
+
+  const stats = result.stats || {};
+  const lines: string[] = ['[traverse]'];
+  lines.push(`root: ${root.isDao ? '[DAO] ' : ''}${root.name} → ${root.filePath || '?'}`);
+  if (root.children) {
+    for (const child of root.children) {
+      lines.push(...formatTraverseNode(child, 1));
+    }
+  }
+  lines.push('');
+  lines.push(`nodes: ${stats.totalNodes || 0} | dao: ${stats.daoNodes || 0} | depth: ${stats.maxDepthReached || 0}${stats.truncated ? ' | truncated' : ''}`);
+  lines.push('[/traverse]');
+  return lines.join('\n');
+}
+
+// ─── Call Paths Formatter ─────────────────────────────────────────────
+
+function formatCallPathsResult(result: any): string {
+  if (result.error) return `Error: ${result.error}`;
+  if (result.status === 'ambiguous') {
+    const lines = [`Multiple symbols found. Disambiguate with target_uid:\n`];
+    for (const c of result.candidates || []) {
+      lines.push(`  ${c.name} (${c.kind}) → ${c.filePath}  uid: ${c.uid}`);
+    }
+    return lines.join('\n');
+  }
+
+  const from = result.from;
+  const paths = result.paths || [];
+  const stats = result.stats || {};
+
+  const lines: string[] = ['[call_paths]'];
+  lines.push(`from: ${from?.name || '?'} → ${from?.filePath || '?'}`);
+  lines.push('');
+  if (paths.length === 0) {
+    lines.push('paths: none');
+  } else {
+    lines.push('paths:');
+    for (const p of paths) {
+      const steps = p.steps || [];
+      lines.push(`  ${steps.join(' → ')}${p.endNode?.isDao ? ' [DAO]' : ''}`);
+    }
+  }
+  lines.push('');
+  lines.push(`total: ${stats.totalPaths || 0} paths | max_depth: ${stats.maxDepthUsed || 0}${stats.truncated ? ' | truncated' : ''}`);
+  lines.push('[/call_paths]');
+  return lines.join('\n');
+}
+
 /**
  * Format a tool result as compact, LLM-friendly text.
  */
@@ -291,6 +366,10 @@ function formatToolResult(toolName: string, result: any): string {
       return formatDetectChangesResult(result);
     case 'list_repos':
       return formatListReposResult(result);
+    case 'traverse':
+      return formatTraverseResult(result);
+    case 'call_paths':
+      return formatCallPathsResult(result);
     default:
       return typeof result === 'string' ? result : JSON.stringify(result, null, 2);
   }
@@ -316,6 +395,12 @@ function getNextStepHint(toolName: string): string {
 
     case 'detect_changes':
       return '\n---\nNext: Run gitnexus-context "<symbol>" on high-risk changed symbols to check their callers.';
+
+    case 'traverse':
+      return '\n---\nNext: To find exact paths to DAO, run call_paths with the same symbol.';
+
+    case 'call_paths':
+      return '\n---\nNext: Read the DAO source files to confirm SQL/table names.';
 
     default:
       return '';
@@ -423,7 +508,9 @@ export async function evalServerCommand(options?: EvalServerOptions): Promise<vo
     console.error(`  POST /tool/query    — search execution flows`);
     console.error(`  POST /tool/context  — 360-degree symbol view`);
     console.error(`  POST /tool/impact   — blast radius analysis`);
-    console.error(`  POST /tool/cypher   — raw Cypher query`);
+    console.error(`  POST /tool/cypher    — raw Cypher query`);
+    console.error(`  POST /tool/traverse — graph BFS tree traversal`);
+    console.error(`  POST /tool/call_paths — find paths to DAO`);
     console.error(`  GET  /health        — health check`);
     console.error(`  POST /shutdown      — graceful shutdown`);
     if (idleTimeoutSec > 0) {

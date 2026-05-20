@@ -693,6 +693,10 @@ export class LocalBackend {
         return this.toolMap(repo, params);
       case 'api_impact':
         return this.apiImpact(repo, params);
+      case 'traverse':
+        return this.traverse(repo, params);
+      case 'call_paths':
+        return this.callPaths(repo, params);
       default:
         throw new Error(`Unknown tool: ${method}`);
     }
@@ -3354,6 +3358,329 @@ export class LocalBackend {
       /* no ENTRY_POINT_OF edges yet */
     }
     return result;
+  }
+
+  // ─── DAO Detection ──────────────────────────────────────────────────
+
+  private static readonly DAO_PATH_PATTERNS = ['/dao/', '/repository/', '/mapper/', '/store/', '/globaldao/'];
+
+  private static isDao(filePath: string): boolean {
+    const lower = (filePath || '').toLowerCase();
+    return LocalBackend.DAO_PATH_PATTERNS.some((p) => lower.includes(p));
+  }
+
+  // ─── Graph Traverse ─────────────────────────────────────────────────
+
+  /**
+   * BFS traverse from a symbol, returning a tree structure.
+   * Uses global visited set → each node appears once (spanning tree).
+   * DAO nodes are marked and not expanded further (pruning).
+   */
+  private async traverse(
+    repo: RepoHandle,
+    params: {
+      name?: string;
+      target_uid?: string;
+      direction: 'upstream' | 'downstream';
+      maxDepth?: number;
+      maxNodes?: number;
+      relationTypes?: string[];
+      includeTests?: boolean;
+      markDao?: boolean;
+    },
+  ): Promise<any> {
+    await this.ensureInitialized(repo.id);
+
+    const direction = params.direction || 'downstream';
+    const maxDepth = Math.min(params.maxDepth || (direction === 'upstream' ? 5 : 8), 32);
+    const maxNodes = params.maxNodes || (direction === 'upstream' ? 50 : 200);
+    const rawRelTypes = params.relationTypes?.filter((t: string) => VALID_RELATION_TYPES.has(t));
+    const relationTypes =
+      rawRelTypes && rawRelTypes.length > 0 ? rawRelTypes : ['CALLS'];
+    const includeTests = params.includeTests ?? false;
+    const markDao = params.markDao ?? true;
+
+    // Resolve symbol
+    const outcome = await this.resolveSymbolCandidates(
+      repo,
+      { uid: params.target_uid, name: params.name },
+      {},
+    );
+
+    if (outcome.kind === 'not_found') {
+      return { error: `Target '${params.target_uid ?? params.name}' not found` };
+    }
+    if (outcome.kind === 'ambiguous') {
+      return {
+        status: 'ambiguous',
+        message: `Found ${outcome.candidates.length} symbols matching '${params.name}'. Disambiguate with target_uid.`,
+        candidates: outcome.candidates.map((c) => ({
+          uid: c.id,
+          name: c.name,
+          kind: c.type,
+          filePath: c.filePath,
+        })),
+      };
+    }
+
+    const sym = outcome.symbol;
+    const rootNode = {
+      id: sym.id,
+      name: sym.name,
+      type: sym.type || outcome.resolvedLabel || '',
+      filePath: sym.filePath || '',
+      isDao: markDao && LocalBackend.isDao(sym.filePath || ''),
+      children: [] as any[],
+    };
+
+    // BFS with parentId tracking
+    const relTypeFilter = relationTypes.map((t) => `'${t}'`).join(', ');
+    const visited = new Set<string>([sym.id]);
+    let frontier = [sym.id];
+    const nodeMap = new Map<string, any>([[sym.id, rootNode]]);
+    let totalNodes = 1;
+    let daoCount = rootNode.isDao ? 1 : 0;
+    let maxDepthReached = 0;
+    let truncated = false;
+
+    for (let depth = 1; depth <= maxDepth && frontier.length > 0; depth++) {
+      if (totalNodes >= maxNodes) {
+        truncated = true;
+        break;
+      }
+
+      const nextFrontier: string[] = [];
+      const idList = frontier.map((id) => `'${id.replace(/'/g, "''")}'`).join(', ');
+      const query =
+        direction === 'upstream'
+          ? `MATCH (caller)-[r:CodeRelation]->(n) WHERE n.id IN [${idList}] AND r.type IN [${relTypeFilter}] RETURN n.id AS sourceId, caller.id AS id, caller.name AS name, labels(caller)[0] AS type, caller.filePath AS filePath`
+          : `MATCH (n)-[r:CodeRelation]->(callee) WHERE n.id IN [${idList}] AND r.type IN [${relTypeFilter}] RETURN n.id AS sourceId, callee.id AS id, callee.name AS name, labels(callee)[0] AS type, callee.filePath AS filePath`;
+
+      try {
+        const rows = await executeQuery(repo.id, query);
+
+        for (const row of rows) {
+          const relId = row.id ?? row[1];
+          const filePath = row.filePath ?? row[4] ?? '';
+          const sourceId = row.sourceId ?? row[0];
+
+          if (!includeTests && isTestFilePath(filePath)) continue;
+          if (visited.has(relId)) continue;
+
+          visited.add(relId);
+          totalNodes++;
+
+          const isNodeDao = markDao && LocalBackend.isDao(filePath);
+          if (isNodeDao) daoCount++;
+
+          const childNode = {
+            id: relId,
+            name: row.name ?? row[2] ?? '?',
+            type: row.type ?? row[3] ?? '',
+            filePath,
+            isDao: isNodeDao,
+            children: [] as any[],
+          };
+
+          nodeMap.set(relId, childNode);
+
+          // Attach to parent
+          const parentNode = nodeMap.get(sourceId);
+          if (parentNode) {
+            parentNode.children.push(childNode);
+          }
+
+          // Don't expand DAO nodes further (pruning)
+          if (!isNodeDao) {
+            nextFrontier.push(relId);
+          }
+
+          if (totalNodes >= maxNodes) {
+            truncated = true;
+            break;
+          }
+        }
+      } catch (e) {
+        logQueryError('traverse:depth-traversal', e);
+        truncated = true;
+        break;
+      }
+
+      maxDepthReached = depth;
+      frontier = nextFrontier;
+    }
+
+    return {
+      root: rootNode,
+      stats: {
+        totalNodes,
+        maxDepthReached,
+        daoNodes: daoCount,
+        truncated,
+      },
+    };
+  }
+
+  // ─── Call Paths ─────────────────────────────────────────────────────
+
+  /**
+   * Find all paths from a symbol to DAO nodes.
+   * Uses path-level visited (allows same node in different paths, prevents cycles).
+   */
+  private async callPaths(
+    repo: RepoHandle,
+    params: {
+      name?: string;
+      target_uid?: string;
+      direction?: 'upstream' | 'downstream';
+      stopAt?: string;
+      maxDepth?: number;
+      maxPaths?: number;
+    },
+  ): Promise<any> {
+    await this.ensureInitialized(repo.id);
+
+    const direction = params.direction || 'downstream';
+    const stopAt = params.stopAt || 'dao';
+    const maxDepth = Math.min(params.maxDepth || 10, 32);
+    const maxPaths = params.maxPaths || 20;
+    const MAX_QUEUE_SIZE = 5000;
+
+    // Resolve symbol
+    const outcome = await this.resolveSymbolCandidates(
+      repo,
+      { uid: params.target_uid, name: params.name },
+      {},
+    );
+
+    if (outcome.kind === 'not_found') {
+      return { error: `Target '${params.target_uid ?? params.name}' not found` };
+    }
+    if (outcome.kind === 'ambiguous') {
+      return {
+        status: 'ambiguous',
+        message: `Found ${outcome.candidates.length} symbols matching '${params.name}'. Disambiguate with target_uid.`,
+        candidates: outcome.candidates.map((c) => ({
+          uid: c.id,
+          name: c.name,
+          kind: c.type,
+          filePath: c.filePath,
+        })),
+      };
+    }
+
+    const sym = outcome.symbol;
+    const fromNode = { name: sym.name, filePath: sym.filePath || '' };
+
+    interface PathState {
+      currentId: string;
+      path: Array<{ id: string; name: string; filePath: string }>;
+      visited: Set<string>;
+    }
+
+    const foundPaths: Array<{
+      steps: string[];
+      endNode: { name: string; filePath: string; isDao: boolean };
+      depth: number;
+    }> = [];
+
+    // BFS queue with path-level visited
+    let queue: PathState[] = [
+      {
+        currentId: sym.id,
+        path: [{ id: sym.id, name: sym.name, filePath: sym.filePath || '' }],
+        visited: new Set([sym.id]),
+      },
+    ];
+
+    let truncated = false;
+    let maxDepthUsed = 0;
+
+    for (let depth = 1; depth <= maxDepth && queue.length > 0; depth++) {
+      if (foundPaths.length >= maxPaths) break;
+
+      const nextQueue: PathState[] = [];
+
+      // Collect all frontier node IDs for batch query
+      const frontierIds = [...new Set(queue.map((s) => s.currentId))];
+      const idList = frontierIds.map((id) => `'${id.replace(/'/g, "''")}'`).join(', ');
+      const query =
+        direction === 'upstream'
+          ? `MATCH (caller)-[r:CodeRelation]->(n) WHERE n.id IN [${idList}] AND r.type = 'CALLS' RETURN n.id AS sourceId, caller.id AS id, caller.name AS name, caller.filePath AS filePath`
+          : `MATCH (n)-[r:CodeRelation]->(callee) WHERE n.id IN [${idList}] AND r.type = 'CALLS' RETURN n.id AS sourceId, callee.id AS id, callee.name AS name, callee.filePath AS filePath`;
+
+      let rows: any[];
+      try {
+        rows = await executeQuery(repo.id, query);
+      } catch (e) {
+        logQueryError('call_paths:depth-traversal', e);
+        truncated = true;
+        break;
+      }
+
+      // Build adjacency: sourceId -> [{id, name, filePath}]
+      const adj = new Map<string, Array<{ id: string; name: string; filePath: string }>>();
+      for (const row of rows) {
+        const sourceId = row.sourceId ?? row[0];
+        const targetId = row.id ?? row[1];
+        const name = row.name ?? row[2] ?? '?';
+        const filePath = row.filePath ?? row[3] ?? '';
+        if (!adj.has(sourceId)) adj.set(sourceId, []);
+        adj.get(sourceId)!.push({ id: targetId, name, filePath });
+      }
+
+      // Expand each path state
+      for (const state of queue) {
+        const neighbors = adj.get(state.currentId) || [];
+        for (const neighbor of neighbors) {
+          if (state.visited.has(neighbor.id)) continue; // cycle in this path
+
+          const newPath = [...state.path, { id: neighbor.id, name: neighbor.name, filePath: neighbor.filePath }];
+          // stopAt 终止条件（默认 dao = DAO 路径匹配）
+          const isTerminal = stopAt === 'dao' ? LocalBackend.isDao(neighbor.filePath) : false;
+
+          maxDepthUsed = Math.max(maxDepthUsed, newPath.length);
+
+          if (isTerminal) {
+            // Found a terminal endpoint — record path
+            foundPaths.push({
+              steps: newPath.map((n) => n.name),
+              endNode: { name: neighbor.name, filePath: neighbor.filePath, isDao: stopAt === 'dao' },
+              depth: newPath.length,
+            });
+            if (foundPaths.length >= maxPaths) break;
+          } else {
+            // Continue exploring
+            const newVisited = new Set(state.visited);
+            newVisited.add(neighbor.id);
+            nextQueue.push({
+              currentId: neighbor.id,
+              path: newPath,
+              visited: newVisited,
+            });
+          }
+        }
+        if (foundPaths.length >= maxPaths) break;
+      }
+
+      // Queue size protection
+      if (nextQueue.length > MAX_QUEUE_SIZE) {
+        truncated = true;
+        break;
+      }
+
+      queue = nextQueue;
+    }
+
+    return {
+      from: fromNode,
+      paths: foundPaths,
+      stats: {
+        totalPaths: foundPaths.length,
+        maxDepthUsed,
+        truncated,
+      },
+    };
   }
 
   private async routeMap(repo: RepoHandle, params: { route?: string }): Promise<any> {
