@@ -3362,7 +3362,7 @@ export class LocalBackend {
 
   // ─── DAO Detection ──────────────────────────────────────────────────
 
-  private static readonly DAO_PATH_PATTERNS = ['/dao/', '/repository/', '/mapper/', '/store/', '/globaldao/'];
+  private static readonly DAO_PATH_PATTERNS = ['/dao/', '/repository/', '/mapper/', '/store/', '/globaldao/', 'dao/db/', 'dao/caches/'];
 
   private static isDao(filePath: string): boolean {
     const lower = (filePath || '').toLowerCase();
